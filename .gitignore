@@ -1,0 +1,5 @@
+_image_cache/
+output/
+*.pdf
+__pycache__/
+.env
