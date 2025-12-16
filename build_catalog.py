@@ -17,6 +17,9 @@ from reportlab.platypus import Paragraph
 from reportlab.pdfbase.pdfmetrics import stringWidth
 from reportlab.lib.colors import Color
 
+# ✅ threading (ONLY addition)
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 
 # ----------------------------
 # Theme
@@ -96,7 +99,9 @@ sectionStyle = ParagraphStyle("SectionStyle", fontName="Helvetica-Bold", fontSiz
 
 nameStyle = ParagraphStyle("NameStyle", fontName="Helvetica-Bold", fontSize=10, leading=12, alignment=1, textColor=ink)
 priceStyle = ParagraphStyle("PriceStyle", fontName="Helvetica", fontSize=10, leading=12, alignment=1, textColor=ink)
-offerBadgeStyle = ParagraphStyle("OfferBadgeStyle", fontName="Helvetica-Bold", fontSize=9, leading=11, alignment=1, textColor=colors.white)
+offerBadgeStyle = ParagraphStyle(
+    "OfferBadgeStyle", fontName="Helvetica-Bold", fontSize=9, leading=11, alignment=1, textColor=colors.white
+)
 
 smallGreyStyle = ParagraphStyle("SmallGreyStyle", fontName="Helvetica", fontSize=9, leading=11, textColor=muted)
 tocTitleStyle = ParagraphStyle("TocTitleStyle", fontName="Helvetica-Bold", fontSize=14, leading=16, textColor=ink)
@@ -342,6 +347,34 @@ def computeFitSizePreferWidth(localImagePath: str, targetWidth: float, maxHeight
         newW = newW * scale2
 
     return newW, newH
+
+
+# ✅ NEW: threaded prefetch (ONLY addition)
+def prefetchImages(products: List[Dict[str, Any]], maxWorkers: int = 12) -> None:
+    productIds: List[int] = []
+    for p in products:
+        try:
+            pid = int(p.get("id") or 0)
+            if pid > 0:
+                productIds.append(pid)
+        except Exception:
+            continue
+
+    if not productIds:
+        return
+
+    ensureDir(imageCacheDir)
+    print(f"📥 Prefetching {len(productIds)} images with {maxWorkers} threads...")
+
+    with ThreadPoolExecutor(max_workers=maxWorkers) as executor:
+        futures = [executor.submit(downloadImageToCache, pid) for pid in productIds]
+        for f in as_completed(futures):
+            try:
+                f.result()
+            except Exception:
+                pass
+
+    print("✅ Prefetch complete")
 
 
 # ----------------------------
@@ -640,6 +673,7 @@ def drawCategoryPages(
             if not rowItems:
                 continue
 
+            # ✅ Center last row if only 1 item in that row
             if len(rowItems) == 1:
                 xPositions = [marginLeft + (contentWidth - columnWidth) / 2]
             else:
@@ -678,6 +712,9 @@ def buildCatalog() -> None:
     allProducts = loadProducts(jsonPath)
     if maxProductsTotal:
         allProducts = allProducts[:maxProductsTotal]
+
+    # ✅ Threaded prefetch (ONLY addition)
+    prefetchImages(allProducts, maxWorkers=12)
 
     offersHierarchy = buildHierarchy(allProducts, offerOnly=True)
     regularHierarchy = buildHierarchy(allProducts, offerOnly=False)
