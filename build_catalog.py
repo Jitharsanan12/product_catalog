@@ -2,8 +2,9 @@ import os
 import io
 import json
 import math
+from uuid import uuid4
 from datetime import datetime
-from typing import Dict, Any, List, Tuple, Optional
+from typing import Dict, Any, List, Tuple, Optional, Literal
 
 import requests
 from PIL import Image as PILImage
@@ -17,13 +18,16 @@ from reportlab.platypus import Paragraph
 from reportlab.pdfbase.pdfmetrics import stringWidth
 from reportlab.lib.colors import Color
 
-# ✅ threading (ONLY addition)
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import FileResponse
+from pydantic import BaseModel, Field
 
-# ----------------------------
-# Theme
-# ----------------------------
+
+# ============================================================
+# THEME
+# ============================================================
 brandMaroon = colors.HexColor("#7A1631")
 brandMaroonDark = colors.HexColor("#5F1026")
 accentGreen = colors.HexColor("#1E8E3E")
@@ -33,25 +37,22 @@ ruleGrey = colors.HexColor("#D8D8D8")
 cardFill = colors.HexColor("#FAFAFA")
 
 
-# ----------------------------
-# Paths / Config
-# ----------------------------
+# ============================================================
+# CONFIG
+# ============================================================
 baseDir = os.path.dirname(os.path.abspath(__file__))
 jsonPath = os.path.join(baseDir, "products.json")
-outputPdfPath = os.path.join(baseDir, "catalog.pdf")
 
 imageUrlTemplate = "https://superasia.ca/web/image/product.product/{productId}/image_512"
 imageCacheDir = os.path.join(baseDir, "_image_cache")
 
+# Keep None for full
 maxProductsTotal: Optional[int] = None
 
 httpTimeoutSeconds = 20
 httpRetries = 3
 httpHeaders = {
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome Safari"
-    )
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari"
 }
 
 cachedJpegQuality = 72
@@ -60,12 +61,13 @@ cachedMinBytes = 2000
 jpegOptimize = True
 jpegProgressive = True
 
+# TOC rule: show categories only if brand has more than this count
 tocShowCategoriesIfMoreThan = 5
 
 
-# ----------------------------
-# Page / Layout
-# ----------------------------
+# ============================================================
+# PAGE / LAYOUT (static parts)
+# ============================================================
 pageWidth, pageHeight = LETTER
 
 marginLeft = 0.55 * inch
@@ -75,48 +77,68 @@ marginBottom = 0.60 * inch
 
 footerReserved = 0.50 * inch
 
+# Header bar
 headerBarHeight = 0.42 * inch
 headerGapBelow = 0.18 * inch
 
-columns = 2
-rowsPerPage = 3
-itemsPerPage = columns * rowsPerPage
-
-gutter = 0.35 * inch
 contentWidth = pageWidth - marginLeft - marginRight
-columnWidth = (contentWidth - gutter) / columns
 
-rowGap = 12
-
+# Card spacing
 cardPadding = 7
 
 
-# ----------------------------
-# Styles
-# ----------------------------
+def getLayout(productsPerPage: int) -> Dict[str, Any]:
+    """
+    Only 2 options allowed:
+      6  => 2x3
+      12 => 3x4
+    """
+    if productsPerPage == 6:
+        columns = 2
+        rowsPerPage = 3
+        gutter = 0.35 * inch
+        rowGap = 12
+    elif productsPerPage == 12:
+        columns = 3
+        rowsPerPage = 4
+        gutter = 0.22 * inch
+        rowGap = 10
+    else:
+        raise ValueError("productsPerPage must be 6 or 12")
+
+    columnWidth = (contentWidth - (gutter * (columns - 1))) / columns
+    itemsPerPage = columns * rowsPerPage
+
+    return {
+        "productsPerPage": productsPerPage,
+        "columns": columns,
+        "rowsPerPage": rowsPerPage,
+        "itemsPerPage": itemsPerPage,
+        "gutter": gutter,
+        "rowGap": rowGap,
+        "columnWidth": columnWidth,
+    }
+
+
+# ============================================================
+# STYLES
+# ============================================================
 titleStyle = ParagraphStyle("TitleStyle", fontName="Helvetica-Bold", fontSize=15, leading=17, textColor=ink)
 sectionStyle = ParagraphStyle("SectionStyle", fontName="Helvetica-Bold", fontSize=11, leading=13, textColor=ink)
 
 nameStyle = ParagraphStyle("NameStyle", fontName="Helvetica-Bold", fontSize=10, leading=12, alignment=1, textColor=ink)
 priceStyle = ParagraphStyle("PriceStyle", fontName="Helvetica", fontSize=10, leading=12, alignment=1, textColor=ink)
-offerBadgeStyle = ParagraphStyle(
-    "OfferBadgeStyle", fontName="Helvetica-Bold", fontSize=9, leading=11, alignment=1, textColor=colors.white
-)
+offerBadgeStyle = ParagraphStyle("OfferBadgeStyle", fontName="Helvetica-Bold", fontSize=9, leading=11, alignment=1, textColor=colors.white)
 
 smallGreyStyle = ParagraphStyle("SmallGreyStyle", fontName="Helvetica", fontSize=9, leading=11, textColor=muted)
 tocTitleStyle = ParagraphStyle("TocTitleStyle", fontName="Helvetica-Bold", fontSize=14, leading=16, textColor=ink)
 
 
-# ----------------------------
-# Helpers
-# ----------------------------
+# ============================================================
+# UTIL
+# ============================================================
 def ensureDir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
-
-
-def safeStr(value: Any) -> str:
-    return str(value).strip() if value is not None else ""
-
 
 def parseFloatSafe(value: Any) -> Optional[float]:
     if value is None:
@@ -128,21 +150,24 @@ def parseFloatSafe(value: Any) -> Optional[float]:
     except Exception:
         return None
 
-
 def money(value: Any) -> Optional[float]:
     v = parseFloatSafe(value)
     if v is None:
         return None
     return round(v + 1e-9, 2)
 
+def safeStr(v: Any) -> str:
+    return str(v).strip() if v is not None else ""
 
 def rangeText(startPage: int, endPage: int) -> str:
-    return f"(Page {startPage})" if startPage == endPage else f"(Pages {startPage}–{endPage})"
-
+    if startPage == endPage:
+        return f"(Page {startPage})"
+    return f"(Pages {startPage}–{endPage})"
 
 def rangePlain(startPage: int, endPage: int) -> str:
-    return f"{startPage}" if startPage == endPage else f"{startPage}–{endPage}"
-
+    if startPage == endPage:
+        return f"{startPage}"
+    return f"{startPage}–{endPage}"
 
 def wrapTextLines(text: str, fontName: str, fontSize: int, maxWidth: float, maxLines: int) -> List[str]:
     text = safeStr(text)
@@ -157,23 +182,21 @@ def wrapTextLines(text: str, fontName: str, fontSize: int, maxWidth: float, maxL
     current = ""
 
     for w in words:
-        candidate = w if not current else f"{current} {w}"
-        if fits(candidate):
-            current = candidate
-            continue
-
-        if current:
-            lines.append(current)
-        current = w
-
-        if len(lines) >= maxLines:
-            break
+        cand = w if not current else (current + " " + w)
+        if fits(cand):
+            current = cand
+        else:
+            if current:
+                lines.append(current)
+            current = w
+            if len(lines) >= maxLines:
+                break
 
     if len(lines) < maxLines and current:
         lines.append(current)
 
-    usedWords = sum(len(line.split()) for line in lines)
-    if usedWords < len(words):
+    usedWordsCount = sum(len(line.split()) for line in lines)
+    if usedWordsCount < len(words):
         last = lines[-1]
         ell = "…"
         while last and not fits(last + ell):
@@ -183,40 +206,24 @@ def wrapTextLines(text: str, fontName: str, fontSize: int, maxWidth: float, maxL
     return lines[:maxLines]
 
 
-def measureParagraphHeight(text: str, style: ParagraphStyle, width: float) -> float:
-    p = Paragraph(text, style)
-    _, h = p.wrap(width, 10000)
-    return h
-
-
-def drawParagraph(c: canvas.Canvas, text: str, style: ParagraphStyle, x: float, yTop: float, width: float) -> float:
-    p = Paragraph(text, style)
-    _, h = p.wrap(width, 10000)
-    p.drawOn(c, x, yTop - h)
-    return h
-
-
-# ----------------------------
-# Data
-# ----------------------------
-def loadProducts(path: str) -> List[Dict[str, Any]]:
-    with open(path, "r", encoding="utf-8") as f:
+# ============================================================
+# DATA
+# ============================================================
+def loadProducts(jsonFilePath: str) -> List[Dict[str, Any]]:
+    with open(jsonFilePath, "r", encoding="utf-8") as f:
         raw = json.load(f)
 
     if isinstance(raw, dict):
         return list(raw.values())
     if isinstance(raw, list):
         return raw
-
-    raise ValueError("Unexpected JSON structure (expected dict or list)")
-
+    raise ValueError("Unexpected JSON structure (must be dict or list)")
 
 def getSecondCategory(categoryStr: str) -> str:
     if not categoryStr:
         return "Other"
     parts = [p.strip() for p in categoryStr.split("/") if p.strip()]
     return parts[1] if len(parts) >= 2 else parts[0]
-
 
 def getBrand(product: Dict[str, Any]) -> str:
     for key in ("brand", "brandName", "manufacturer"):
@@ -225,16 +232,15 @@ def getBrand(product: Dict[str, Any]) -> str:
             return b
     return "Other"
 
-
 def minPriceListPrice(product: Dict[str, Any]) -> Optional[float]:
     lowest = None
     for tier in product.get("priceList", []) or []:
         fp = money(tier.get("fixedPrice"))
         if fp is None:
             continue
-        lowest = fp if lowest is None else min(lowest, fp)
+        if lowest is None or fp < lowest:
+            lowest = fp
     return lowest
-
 
 def isOfferProduct(product: Dict[str, Any]) -> bool:
     reg = money(product.get("regularPrice"))
@@ -242,42 +248,38 @@ def isOfferProduct(product: Dict[str, Any]) -> bool:
         reg = money(product.get("price"))
     if reg is None:
         return False
-
     lowest = minPriceListPrice(product)
-    return (lowest is not None) and (lowest < reg)
-
+    if lowest is None:
+        return False
+    return lowest < reg
 
 def getOfferPrice(product: Dict[str, Any]) -> Optional[float]:
-    return minPriceListPrice(product) if isOfferProduct(product) else None
-
+    if not isOfferProduct(product):
+        return None
+    return minPriceListPrice(product)
 
 def buildHierarchy(products: List[Dict[str, Any]], offerOnly: bool) -> Dict[str, Dict[str, List[Dict[str, Any]]]]:
     filtered = [p for p in products if (isOfferProduct(p) if offerOnly else (not isOfferProduct(p)))]
-
-    filtered.sort(
-        key=lambda p: (
-            getBrand(p).upper(),
-            getSecondCategory(safeStr(p.get("category"))).upper(),
-            safeStr(p.get("name")).upper(),
-        )
-    )
+    filtered.sort(key=lambda p: (
+        getBrand(p).upper(),
+        getSecondCategory(safeStr(p.get("category"))).upper(),
+        safeStr(p.get("name")).upper(),
+    ))
 
     hierarchy: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
     for p in filtered:
         brand = getBrand(p)
         category = getSecondCategory(safeStr(p.get("category")))
         hierarchy.setdefault(brand, {}).setdefault(category, []).append(p)
-
     return hierarchy
 
 
-# ----------------------------
-# Images
-# ----------------------------
+# ============================================================
+# IMAGE CACHE
+# ============================================================
 def getCachedImagePath(productId: int) -> str:
     ensureDir(imageCacheDir)
     return os.path.join(imageCacheDir, f"{productId}.jpg")
-
 
 def normalizeAndCompressImage(img: PILImage.Image) -> PILImage.Image:
     if img.mode not in ("RGB", "RGBA"):
@@ -300,7 +302,6 @@ def normalizeAndCompressImage(img: PILImage.Image) -> PILImage.Image:
 
     return img
 
-
 def downloadImageToCache(productId: int) -> Optional[str]:
     localPath = getCachedImagePath(productId)
 
@@ -317,6 +318,7 @@ def downloadImageToCache(productId: int) -> Optional[str]:
 
             img = PILImage.open(io.BytesIO(r.content))
             img = normalizeAndCompressImage(img)
+
             img.save(
                 localPath,
                 "JPEG",
@@ -329,7 +331,6 @@ def downloadImageToCache(productId: int) -> Optional[str]:
             continue
 
     return None
-
 
 def computeFitSizePreferWidth(localImagePath: str, targetWidth: float, maxHeight: float) -> Tuple[float, float]:
     img = PILImage.open(localImagePath)
@@ -349,7 +350,6 @@ def computeFitSizePreferWidth(localImagePath: str, targetWidth: float, maxHeight
     return newW, newH
 
 
-# ✅ NEW: threaded prefetch (ONLY addition)
 def prefetchImages(products: List[Dict[str, Any]], maxWorkers: int = 12) -> None:
     productIds: List[int] = []
     for p in products:
@@ -360,6 +360,7 @@ def prefetchImages(products: List[Dict[str, Any]], maxWorkers: int = 12) -> None
         except Exception:
             continue
 
+    productIds = sorted(set(productIds))
     if not productIds:
         return
 
@@ -377,9 +378,24 @@ def prefetchImages(products: List[Dict[str, Any]], maxWorkers: int = 12) -> None
     print("✅ Prefetch complete")
 
 
-# ----------------------------
-# Pricing text
-# ----------------------------
+# ============================================================
+# TEXT DRAW
+# ============================================================
+def measureParagraphHeight(text: str, style: ParagraphStyle, width: float) -> float:
+    p = Paragraph(text, style)
+    _, h = p.wrap(width, 10000)
+    return h
+
+def drawParagraph(c: canvas.Canvas, text: str, style: ParagraphStyle, x: float, yTop: float, width: float) -> float:
+    p = Paragraph(text, style)
+    _, h = p.wrap(width, 10000)
+    p.drawOn(c, x, yTop - h)
+    return h
+
+
+# ============================================================
+# PRICE LINES
+# ============================================================
 def buildCompactPriceLines(product: Dict[str, Any], isOffer: bool) -> List[str]:
     if isOffer:
         reg = money(product.get("regularPrice"))
@@ -395,12 +411,14 @@ def buildCompactPriceLines(product: Dict[str, Any], isOffer: bool) -> List[str]:
         return lines[:2]
 
     base = money(product.get("price"))
-    return [f"Price: ${base:,.2f}"] if base is not None else ["Price: N/A"]
+    if base is not None:
+        return [f"Price: ${base:,.2f}"]
+    return ["Price: N/A"]
 
 
-# ----------------------------
-# Header / Footer
-# ----------------------------
+# ============================================================
+# HEADER / FOOTER
+# ============================================================
 def drawFooter(c: canvas.Canvas, pageNo: int, generatedOn: str) -> None:
     yLine = marginBottom + 6
     c.setStrokeColor(ruleGrey)
@@ -417,7 +435,6 @@ def drawFooter(c: canvas.Canvas, pageNo: int, generatedOn: str) -> None:
     c.drawString(marginLeft + contentWidth - w, y, rightText)
     c.setFillColor(ink)
 
-
 def drawBrandCategoryBar(c: canvas.Canvas, brandName: str, brandRange: str, categoryName: str, yStartTop: float) -> float:
     barY = yStartTop - headerBarHeight
 
@@ -425,7 +442,7 @@ def drawBrandCategoryBar(c: canvas.Canvas, brandName: str, brandRange: str, cate
     c.rect(marginLeft, barY, contentWidth, headerBarHeight, fill=1, stroke=0)
 
     padX = 12
-    midY = barY + headerBarHeight / 2.0
+    midY = barY + (headerBarHeight / 2.0)
 
     leftText = f"{brandName.upper()} {brandRange}".strip()
     rightText = safeStr(categoryName).title()
@@ -443,7 +460,6 @@ def drawBrandCategoryBar(c: canvas.Canvas, brandName: str, brandRange: str, cate
 
     c.setFillColor(colors.HexColor("#F2F2F2"))
     c.drawString(rightX, midY - 5, sep)
-
     c.setFillColor(colors.white)
     c.drawString(rightX + sepW, midY - 5, rightText)
 
@@ -455,9 +471,9 @@ def drawBrandCategoryBar(c: canvas.Canvas, brandName: str, brandRange: str, cate
     return yAfter - (headerGapBelow - 8)
 
 
-# ----------------------------
-# TOC rendering
-# ----------------------------
+# ============================================================
+# TOC (leader dots)
+# ============================================================
 def drawTocRow(c: canvas.Canvas, leftText: str, rightText: str, x: float, y: float, width: float, indent: float = 0) -> float:
     fontName = "Helvetica"
     fontSize = 10
@@ -488,9 +504,9 @@ def drawTocRow(c: canvas.Canvas, leftText: str, rightText: str, x: float, y: flo
     return 16
 
 
-# ----------------------------
-# Product card
-# ----------------------------
+# ============================================================
+# PRODUCT CARD
+# ============================================================
 def drawFloatingUomBadge(c: canvas.Canvas, xRight: float, yTop: float, text: str) -> None:
     text = safeStr(text)
     if not text:
@@ -532,7 +548,6 @@ def drawFloatingUomBadge(c: canvas.Canvas, xRight: float, yTop: float, text: str
 
     c.restoreState()
 
-
 def drawProductCardFixed(
     c: canvas.Canvas,
     x: float,
@@ -564,14 +579,13 @@ def drawProductCardFixed(
     textTopGap = 6
     textBetweenGap = 4
     textBottomGap = 10
-
     textZoneH = textTopGap + nameH + textBetweenGap + priceH + textBottomGap
     if isOffer:
         textZoneH += 14
 
     imageTextGap = 6
     maxImageZoneH = cardHeight - (cardPadding * 2) - textZoneH - imageTextGap
-    maxImageZoneH = max(0.9 * inch, maxImageZoneH)
+    maxImageZoneH = max(0.85 * inch, maxImageZoneH)
 
     imageZoneTop = yTop - cardPadding
     imageZoneBottom = imageZoneTop - maxImageZoneH
@@ -599,15 +613,10 @@ def drawProductCardFixed(
     uom = safeStr(product.get("uom"))
     if uom:
         badgePad = 6
-        drawFloatingUomBadge(
-            c,
-            xRight=innerX + innerW - badgePad,
-            yTop=imageZoneTop - badgePad,
-            text=uom,
-        )
+        drawFloatingUomBadge(c, xRight=innerX + innerW - badgePad, yTop=imageZoneTop - badgePad, text=uom)
 
     textZoneTop = imageZoneBottom - imageTextGap
-    cursorY = textZoneTop - 6  # slight shift down
+    cursorY = textZoneTop - 6
 
     c.setFillColor(ink)
     cursorY -= drawParagraph(c, safeName, nameStyle, innerX, cursorY, innerW)
@@ -626,13 +635,19 @@ def drawProductCardFixed(
         c.setFillColor(ink)
 
 
-# ----------------------------
-# Pagination helpers
-# ----------------------------
-def simulateCategoryPages(items: List[Dict[str, Any]]) -> int:
-    return 1 if not items else int(math.ceil(len(items) / float(itemsPerPage)))
+# ============================================================
+# PASS 1
+# ============================================================
+def simulateCategoryPages(items: List[Dict[str, Any]], itemsPerPage: int) -> int:
+    if not items:
+        return 1
+    return int(math.ceil(len(items) / float(itemsPerPage)))
 
 
+# ============================================================
+# PASS 2 (draw pages) - supports 2x3 and 3x4
+# centers any partial row (1 or 2 cards etc.)
+# ============================================================
 def drawCategoryPages(
     c: canvas.Canvas,
     items: List[Dict[str, Any]],
@@ -642,14 +657,18 @@ def drawCategoryPages(
     categoryName: str,
     pageNoStart: int,
     generatedOn: str,
+    layout: Dict[str, Any],
 ) -> int:
     pageNo = pageNoStart
     startYTop = pageHeight - marginTop
     minY = marginBottom + footerReserved
 
-    col1X = marginLeft
-    col2X = marginLeft + columnWidth + gutter
-    colXs = [col1X, col2X]
+    columns = layout["columns"]
+    rowsPerPage = layout["rowsPerPage"]
+    itemsPerPage = layout["itemsPerPage"]
+    gutter = layout["gutter"]
+    rowGap = layout["rowGap"]
+    columnWidth = layout["columnWidth"]
 
     def pageHeader() -> float:
         return drawBrandCategoryBar(c, brandName, brandRange, categoryName, startYTop)
@@ -658,26 +677,24 @@ def drawCategoryPages(
     available = headerBottomY - minY
     totalGaps = rowGap * (rowsPerPage - 1)
     cellHeight = (available - totalGaps) / float(rowsPerPage)
-    cellHeight = max(cellHeight, 2.15 * inch)
+    cellHeight = max(cellHeight, 2.10 * inch)
 
     idx = 0
     while idx < len(items):
         pageChunk = items[idx: idx + itemsPerPage]
 
-        y = headerBottomY
         for r in range(rowsPerPage):
-            rowTop = y - (r * (cellHeight + rowGap))
+            rowTop = headerBottomY - (r * (cellHeight + rowGap))
 
-            rowStart = r * columns
-            rowItems = pageChunk[rowStart: rowStart + columns]
+            rowStartIndex = r * columns
+            rowItems = pageChunk[rowStartIndex: rowStartIndex + columns]
             if not rowItems:
                 continue
 
-            # ✅ Center last row if only 1 item in that row
-            if len(rowItems) == 1:
-                xPositions = [marginLeft + (contentWidth - columnWidth) / 2]
-            else:
-                xPositions = colXs
+            count = len(rowItems)
+            rowTotalWidth = (count * columnWidth) + ((count - 1) * gutter)
+            rowStartX = marginLeft + (contentWidth - rowTotalWidth) / 2.0
+            xPositions = [rowStartX + (i * (columnWidth + gutter)) for i in range(count)]
 
             for j, item in enumerate(rowItems):
                 drawProductCardFixed(
@@ -701,10 +718,11 @@ def drawCategoryPages(
     return pageNo + 1
 
 
-# ----------------------------
-# Build PDF
-# ----------------------------
-def buildCatalog() -> None:
+# ============================================================
+# MAIN BUILD
+# ============================================================
+def buildCatalog(productsPerPage: int = 6, prefetchWorkers: int = 12) -> str:
+    layout = getLayout(productsPerPage)
     ensureDir(imageCacheDir)
 
     generatedOn = datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -713,18 +731,18 @@ def buildCatalog() -> None:
     if maxProductsTotal:
         allProducts = allProducts[:maxProductsTotal]
 
-    # ✅ Threaded prefetch (ONLY addition)
-    prefetchImages(allProducts, maxWorkers=12)
+    # threaded prefetch
+    prefetchImages(allProducts, maxWorkers=prefetchWorkers)
 
     offersHierarchy = buildHierarchy(allProducts, offerOnly=True)
     regularHierarchy = buildHierarchy(allProducts, offerOnly=False)
 
-    def countTocRows(h: Dict[str, Dict[str, List[Dict[str, Any]]]]) -> int:
+    def countTocRows(hierarchy: Dict[str, Dict[str, List[Dict[str, Any]]]]) -> int:
         rows = 0
-        for _, cats in h.items():
+        for _, cats in hierarchy.items():
             rows += 1
-            if len(cats) > tocShowCategoriesIfMoreThan:
-                rows += len(cats)
+            if len(cats.keys()) > tocShowCategoriesIfMoreThan:
+                rows += len(cats.keys())
         return rows
 
     offerRows = countTocRows(offersHierarchy)
@@ -738,7 +756,8 @@ def buildCatalog() -> None:
     )
     tocAvailable = (tocTopY - tocHeaderH) - (marginBottom + footerReserved)
     rowsPerTocPage = max(1, int(tocAvailable / 16))
-    tocPages = int(math.ceil((2 + offerRows + regularRows) / float(rowsPerTocPage)))
+    totalTocRows = 2 + offerRows + regularRows
+    tocPages = int(math.ceil(totalTocRows / float(rowsPerTocPage)))
 
     tocStartPage = 2
     contentStartPage = 1 + 1 + tocPages
@@ -758,19 +777,27 @@ def buildCatalog() -> None:
             cats = hierarchy[brandName]
             for categoryName in sorted(cats.keys(), key=lambda s: s.upper()):
                 catStart = currentPage
-                pagesUsed = simulateCategoryPages(cats[categoryName])
+                pagesUsed = simulateCategoryPages(cats[categoryName], layout["itemsPerPage"])
                 catEnd = catStart + pagesUsed - 1
                 categoryRanges[sectionTitle][brandName][categoryName] = (catStart, catEnd)
                 currentPage = catEnd + 1
 
-            brandRanges[sectionTitle][brandName] = (brandStart, currentPage - 1)
+            brandEnd = currentPage - 1
+            brandRanges[sectionTitle][brandName] = (brandStart, brandEnd)
 
     simulateSection("OFFER PRODUCTS", offersHierarchy)
     simulateSection("REGULAR PRODUCTS", regularHierarchy)
 
+    ensureDir(os.path.join(baseDir, "_outputs"))
+    outputPdfPath = os.path.join(
+        baseDir,
+        "_outputs",
+        f"catalog_{productsPerPage}_{layout['columns']}x{layout['rowsPerPage']}_{uuid4().hex}.pdf"
+    )
+
     c = canvas.Canvas(outputPdfPath, pagesize=LETTER)
 
-    # Cover
+    # COVER
     y = pageHeight - marginTop
     c.setFillColor(brandMaroon)
     c.rect(marginLeft, y - 0.35 * inch, contentWidth, 0.35 * inch, fill=1, stroke=0)
@@ -786,6 +813,7 @@ def buildCatalog() -> None:
     y -= drawParagraph(c, "Super Asia Product Catalogue", titleStyle, marginLeft, y, contentWidth) + 10
     y -= drawParagraph(c, "Offer Products and Regular Products", sectionStyle, marginLeft, y, contentWidth) + 18
     y -= drawParagraph(c, f"Generated {generatedOn}", smallGreyStyle, marginLeft, y, contentWidth) + 6
+    y -= drawParagraph(c, f"Layout: {layout['columns']}×{layout['rowsPerPage']} ({productsPerPage} per page)", smallGreyStyle, marginLeft, y, contentWidth) + 10
     y -= drawParagraph(c, "Paper Size: Letter (Canada)", smallGreyStyle, marginLeft, y, contentWidth) + 20
     drawFooter(c, 1, generatedOn)
     c.showPage()
@@ -819,7 +847,6 @@ def buildCatalog() -> None:
         c.setFillColor(colors.white)
         c.setFont("Helvetica-Bold", 11)
         c.drawString(marginLeft + 10, y - 0.28 * inch + 7, "Super Asia")
-
         c.setFillColor(ink)
         y -= (0.28 * inch + 12)
 
@@ -855,12 +882,11 @@ def buildCatalog() -> None:
 
     c.showPage()
 
-    # Content
+    # CONTENT
     pageNo = contentStartPage
 
     def renderSection(sectionTitle: str, hierarchy: Dict[str, Dict[str, List[Dict[str, Any]]]], isOfferSection: bool) -> None:
         nonlocal pageNo
-
         for brandName in sorted(hierarchy.keys(), key=lambda s: s.upper()):
             bStart, bEnd = brandRanges[sectionTitle][brandName]
             brandRangeStr = rangeText(bStart, bEnd)
@@ -876,6 +902,7 @@ def buildCatalog() -> None:
                     categoryName=categoryName,
                     pageNoStart=pageNo,
                     generatedOn=generatedOn,
+                    layout=layout,
                 )
                 c.showPage()
 
@@ -883,13 +910,56 @@ def buildCatalog() -> None:
     renderSection("REGULAR PRODUCTS", regularHierarchy, False)
 
     c.save()
-
     print(f"✅ Catalog created: {outputPdfPath}")
-    print(f"✅ Generated on: {generatedOn}")
-    print(f"✅ Image cache: {imageCacheDir}")
-    print(f"✅ TOC pages: {tocPages}")
-    print(f"✅ Content starts at page: {contentStartPage}")
+    return outputPdfPath
+
+
+# ============================================================
+# FASTAPI
+# ============================================================
+app = FastAPI(title="Catalog PDF Generator", version="1.0.0")
+
+
+class CatalogRequest(BaseModel):
+    productsPerPage: Literal[6, 12] = Field(6, description="Allowed values: 6 or 12")
+    prefetchWorkers: int = Field(12, ge=1, le=32)
+
+
+@app.get("/health")
+def health():
+    return {"ok": True}
+
+
+@app.post("/catalog/pdf")
+def generatePdf(
+    req: CatalogRequest,
+    perPage: Optional[int] = Query(None, description="Optional override: 6 or 12"),
+):
+    # Query param overrides body if provided
+    productsPerPage = perPage if perPage is not None else req.productsPerPage
+
+    if productsPerPage not in (6, 12):
+        raise HTTPException(status_code=400, detail="productsPerPage must be 6 or 12")
+
+    if not os.path.exists(jsonPath):
+        raise HTTPException(status_code=500, detail="products.json not found")
+
+    try:
+        outPath = buildCatalog(productsPerPage=productsPerPage, prefetchWorkers=req.prefetchWorkers)
+
+        # unique filename prevents browser showing old cached PDF
+        downloadName = f"catalog_{productsPerPage}_{uuid4().hex}.pdf"
+
+        return FileResponse(
+            outPath,
+            media_type="application/pdf",
+            filename=downloadName,
+            headers={"Cache-Control": "no-store"},
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to generate PDF: {e}")
 
 
 if __name__ == "__main__":
-    buildCatalog()
+    # Local test without FastAPI
+    buildCatalog(productsPerPage=12)
